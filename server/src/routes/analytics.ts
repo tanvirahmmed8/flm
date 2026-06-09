@@ -9,6 +9,17 @@ export const analyticsRouter = Router();
 const toSqliteDateTime = (timestamp: number) =>
     new Date(timestamp).toISOString().slice(0, 19).replace('T', ' ');
 
+function toCsv(rows: Array<Record<string, unknown>>, columns: string[]): string {
+  const escape = (value: unknown) => {
+    const raw = value == null ? '' : String(value);
+    return `"${raw.replace(/"/g, '""')}"`;
+  };
+
+  const header = columns.map(escape).join(',');
+  const body = rows.map((row) => columns.map((c) => escape(row[c])).join(',')).join('\n');
+  return `${header}\n${body}`;
+}
+
 // Return the rolling cutoff timestamp for the selected analytics range.
 function getSinceTimestamp(range: string): string {
   const now = Date.now();
@@ -264,4 +275,89 @@ analyticsRouter.get('/errors', (req: Request, res: Response) => {
     latencyMs: r.latency_ms,
     createdAt: r.created_at,
   })));
+});
+
+// Last-used models (grouped): most recently seen models in this range.
+analyticsRouter.get('/recent-models', (req: Request, res: Response) => {
+  const range = (req.query.range as string) ?? '7d';
+  const limitRaw = Number(req.query.limit ?? 12);
+  const limit = Number.isFinite(limitRaw) ? Math.min(Math.max(Math.floor(limitRaw), 1), 100) : 12;
+  const since = getSinceTimestamp(range);
+  const db = getDb();
+
+  const rows = db.prepare(`
+    SELECT
+      r.platform,
+      r.model_id,
+      m.display_name,
+      COUNT(*) as requests,
+      SUM(CASE WHEN r.status = 'success' THEN 1 ELSE 0 END) as success_count,
+      MAX(r.created_at) as last_used_at,
+      COALESCE((
+        SELECT r2.status
+        FROM requests r2
+        WHERE r2.platform = r.platform
+          AND r2.model_id = r.model_id
+          AND r2.created_at >= ?
+        ORDER BY r2.created_at DESC, r2.id DESC
+        LIMIT 1
+      ), 'unknown') as last_status
+    FROM requests r
+    LEFT JOIN models m ON m.platform = r.platform AND m.model_id = r.model_id
+    WHERE r.created_at >= ?
+    GROUP BY r.platform, r.model_id
+    ORDER BY last_used_at DESC
+    LIMIT ?
+  `).all(since, since, limit) as any[];
+
+  res.json(rows.map(r => ({
+    platform: r.platform,
+    modelId: r.model_id,
+    displayName: r.display_name ?? r.model_id,
+    requests: r.requests ?? 0,
+    successRate: r.requests > 0 ? Math.round(((r.success_count / r.requests) * 100) * 10) / 10 : 0,
+    lastStatus: r.last_status,
+    lastUsedAt: r.last_used_at,
+  })));
+});
+
+// Download error logs as CSV for the selected range.
+analyticsRouter.get('/errors/export', (req: Request, res: Response) => {
+  const range = (req.query.range as string) ?? '7d';
+  const limitRaw = Number(req.query.limit ?? 5000);
+  const limit = Number.isFinite(limitRaw) ? Math.min(Math.max(Math.floor(limitRaw), 1), 10000) : 5000;
+  const since = getSinceTimestamp(range);
+  const db = getDb();
+
+  const rows = db.prepare(`
+    SELECT id, created_at, platform, model_id, latency_ms, error
+    FROM requests
+    WHERE status = 'error' AND created_at >= ?
+    ORDER BY created_at DESC, id DESC
+    LIMIT ?
+  `).all(since, limit) as Array<{
+    id: number;
+    created_at: string;
+    platform: string;
+    model_id: string;
+    latency_ms: number | null;
+    error: string | null;
+  }>;
+
+  const csv = toCsv(
+    rows.map((r) => ({
+      id: r.id,
+      created_at: r.created_at,
+      platform: r.platform,
+      model_id: r.model_id,
+      latency_ms: r.latency_ms ?? '',
+      error: r.error ?? '',
+    })),
+    ['id', 'created_at', 'platform', 'model_id', 'latency_ms', 'error'],
+  );
+
+  const ts = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
+  res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+  res.setHeader('Content-Disposition', `attachment; filename="analytics-errors-${range}-${ts}.csv"`);
+  res.send(csv);
 });

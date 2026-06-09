@@ -5,6 +5,7 @@ import {
   LineChart, Line, Legend,
 } from 'recharts'
 import { apiFetch } from '@/lib/api'
+import { getToken } from '@/lib/api'
 import { Button } from '@/components/ui/button'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { PageHeader } from '@/components/page-header'
@@ -32,11 +33,12 @@ function Stat({ label, value, hint, className }: { label: string; value: string 
   return hint ? <HoverTooltip text={hint} side="bottom" className="block">{card}</HoverTooltip> : card
 }
 
-function Panel({ title, children }: { title: string; children: React.ReactNode }) {
+function Panel({ title, actions, children }: { title: string; actions?: React.ReactNode; children: React.ReactNode }) {
   return (
     <div className="rounded-3xl border bg-card">
-      <div className="px-4 py-3 border-b">
+      <div className="px-4 py-3 border-b flex items-center justify-between gap-3">
         <h3 className="text-sm font-medium">{title}</h3>
+        {actions}
       </div>
       <div className="p-4">{children}</div>
     </div>
@@ -49,6 +51,7 @@ const primaryFill = 'var(--foreground)'
 
 export default function AnalyticsPage() {
   const [range, setRange] = useState<TimeRange>('7d')
+  const [downloadingErrors, setDownloadingErrors] = useState(false)
 
   const { data: summary } = useQuery({
     queryKey: ['analytics', 'summary', range],
@@ -79,6 +82,39 @@ export default function AnalyticsPage() {
     queryKey: ['analytics', 'error-distribution', range],
     queryFn: () => apiFetch<{ byCategory: any[]; byPlatform: any[]; detailed: any[] }>(`/api/analytics/error-distribution?range=${range}`),
   })
+
+  const { data: recentModels = [] } = useQuery({
+    queryKey: ['analytics', 'recent-models', range],
+    queryFn: () => apiFetch<any[]>(`/api/analytics/recent-models?range=${range}&limit=12`),
+  })
+
+  async function downloadErrorLogs() {
+    setDownloadingErrors(true)
+    try {
+      const token = getToken()
+      const res = await fetch(`/api/analytics/errors/export?range=${range}`, {
+        headers: token ? { Authorization: `Bearer ${token}` } : undefined,
+      })
+      if (!res.ok) throw new Error(`Download failed: HTTP ${res.status}`)
+      const blob = await res.blob()
+      const objectUrl = URL.createObjectURL(blob)
+      const contentDisposition = res.headers.get('content-disposition') ?? ''
+      const matched = contentDisposition.match(/filename="?([^";]+)"?/i)
+      const filename = matched?.[1] ?? `analytics-errors-${range}.csv`
+
+      const a = document.createElement('a')
+      a.href = objectUrl
+      a.download = filename
+      document.body.appendChild(a)
+      a.click()
+      a.remove()
+      URL.revokeObjectURL(objectUrl)
+    } catch (err) {
+      console.error(err)
+    } finally {
+      setDownloadingErrors(false)
+    }
+  }
 
   // Savings card shows ONE stable monthly figure regardless of the selected
   // range: the last-30-days data projected to a full month from its actual
@@ -265,7 +301,52 @@ export default function AnalyticsPage() {
             )}
           </Panel>
 
-          <Panel title="Recent errors">
+          <Panel title="Last used models">
+            {recentModels.length === 0 ? (
+              <p className="text-sm text-muted-foreground text-center py-8">No data yet</p>
+            ) : (
+              <div className="max-h-[240px] overflow-y-auto -mx-4">
+                <Table>
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead className="pl-4">Model</TableHead>
+                      <TableHead>Provider</TableHead>
+                      <TableHead className="text-right">Requests</TableHead>
+                      <TableHead className="text-right">Success</TableHead>
+                      <TableHead className="text-right pr-4">Last used</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {recentModels.map((m: any, i: number) => (
+                      <TableRow key={`${m.platform}-${m.modelId}-${i}`}>
+                        <TableCell className="pl-4 text-sm font-medium">{m.displayName}</TableCell>
+                        <TableCell className="text-xs text-muted-foreground">{m.platform}</TableCell>
+                        <TableCell className="text-right tabular-nums">{m.requests}</TableCell>
+                        <TableCell className="text-right tabular-nums">{m.successRate}%</TableCell>
+                        <TableCell className="text-right text-xs text-muted-foreground tabular-nums pr-4">
+                          {formatSqliteUtcToLocalTime(m.lastUsedAt, {
+                            month: 'short',
+                            day: '2-digit',
+                            hour: '2-digit',
+                            minute: '2-digit',
+                          })}
+                        </TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              </div>
+            )}
+          </Panel>
+
+          <Panel
+            title="Recent errors"
+            actions={(
+              <Button size="xs" variant="outline" onClick={downloadErrorLogs} disabled={downloadingErrors}>
+                {downloadingErrors ? 'Downloading…' : 'Download CSV'}
+              </Button>
+            )}
+          >
             {errors.length === 0 ? (
               <p className="text-sm text-muted-foreground text-center py-8">No errors</p>
             ) : (
