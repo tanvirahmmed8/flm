@@ -321,7 +321,7 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
   };
 
   let { inputTokens: estimatedInputTokens, totalTokens: estimatedTotal } = estimateChatRequestTokens({
-    messages: messages as Array<Record<string, unknown>>,
+    messages: messages as unknown as Array<Record<string, unknown>>,
     maxOutputTokens: reqData.max_output_tokens ?? undefined,
     tools,
     toolChoice: tool_choice,

@@ -24,10 +24,10 @@ export interface CompactChatHistoryResult {
 
 function estimateMessages(
   messages: ChatMessage[],
-  opts: Pick<CompactChatHistoryOptions, 'maxOutputTokens' | 'tools' | 'toolChoice' | 'parallelToolCalls'>,
+  opts: Pick<CompactChatHistoryOptions, 'maxOutputTokens' | 'tools' | 'toolChoice' | 'parallelToolCalls' | 'extraPayload'>,
 ): { inputTokens: number; totalTokens: number } {
   return estimateChatRequestTokens({
-    messages: messages as Array<Record<string, unknown>>,
+    messages: messages as unknown as Array<Record<string, unknown>>,
     maxOutputTokens: opts.maxOutputTokens,
     tools: opts.tools,
     toolChoice: opts.toolChoice,
