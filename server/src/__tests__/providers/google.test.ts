@@ -139,9 +139,11 @@ describe('GoogleProvider', () => {
             name: 'get_weather',
             description: 'Get weather for a city',
             parameters: {
+              title: 'WeatherToolInput',
               type: 'object',
               properties: { city: { type: 'string' } },
               required: ['city'],
+              additionalProperties: false,
             },
           },
         }],
@@ -153,6 +155,14 @@ describe('GoogleProvider', () => {
     );
 
     expect(capturedBody.tools[0].functionDeclarations[0].name).toBe('get_weather');
+    expect(capturedBody.tools[0].functionDeclarations[0].parametersJsonSchema).toEqual({
+      title: 'WeatherToolInput',
+      type: 'object',
+      properties: { city: { type: 'string' } },
+      required: ['city'],
+      additionalProperties: false,
+    });
+    expect(capturedBody.tools[0].functionDeclarations[0].parameters).toBeUndefined();
     expect(capturedBody.toolConfig.functionCallingConfig.mode).toBe('ANY');
     expect(capturedBody.toolConfig.functionCallingConfig.allowedFunctionNames).toEqual(['get_weather']);
   });
@@ -251,6 +261,42 @@ describe('GoogleProvider', () => {
     const assistantEntry = capturedBody.contents.find((c: any) => c.role === 'model');
     expect(assistantEntry.parts[0].thoughtSignature).toBe('sig_123');
     expect(assistantEntry.parts[0].functionCall.name).toBe('get_weather');
+  });
+
+  it('omits replayed assistant tool_calls that lack thought_signature', async () => {
+    let capturedBody: any;
+    vi.spyOn(global, 'fetch').mockImplementation(async (_url, init) => {
+      capturedBody = JSON.parse((init as any).body);
+      return {
+        ok: true,
+        json: () => Promise.resolve({
+          candidates: [{ content: { parts: [{ text: 'ok' }] }, finishReason: 'STOP' }],
+          usageMetadata: { promptTokenCount: 1, candidatesTokenCount: 1, totalTokenCount: 2 },
+        }),
+      } as any;
+    });
+
+    await provider.chatCompletion(
+      'test-key',
+      [
+        { role: 'user', content: 'Weather?' },
+        {
+          role: 'assistant',
+          content: null,
+          tool_calls: [{
+            id: 'call_123',
+            type: 'function',
+            function: { name: 'get_weather', arguments: '{"city":"London"}' },
+          }],
+        },
+        { role: 'tool', tool_call_id: 'call_123', content: '{"temp": 20}' },
+      ],
+      'gemini-2.5-pro',
+    );
+
+    const modelEntries = capturedBody.contents.filter((c: any) => c.role === 'model');
+    expect(modelEntries).toHaveLength(0);
+    expect(JSON.stringify(capturedBody.contents)).toContain('"functionResponse"');
   });
 
   // ── Streaming ──────────────────────────────────────────────────────────────

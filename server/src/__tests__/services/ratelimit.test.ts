@@ -11,6 +11,8 @@ import {
   canUseProvider,
   providerDailyRequestCount,
   getProviderDailyRequestCap,
+  setProviderCooldown,
+  isProviderOnCooldown,
 } from '../../services/ratelimit.js';
 
 function removeDbFile(dbPath: string) {
@@ -187,6 +189,43 @@ describe('Rate Limiter', () => {
         db?.close();
         removeDbFile(dbPath);
       }
+    });
+
+    it('persists provider-wide cooldowns after reload', async () => {
+      process.env.ENCRYPTION_KEY = '0'.repeat(64);
+      const dbPath = `/tmp/freeapi-provider-cooldown-${Date.now()}-${Math.random()}.db`;
+      const keyId = 5252;
+      let db: { close: () => void } | undefined;
+
+      try {
+        vi.resetModules();
+        const dbModule = await import('../../db/index.js');
+        db = dbModule.initDb(dbPath);
+        const limiter = await import('../../services/ratelimit.js');
+
+        limiter.setProviderCooldown('ollama', keyId, 60_000);
+        db.close();
+        db = undefined;
+
+        vi.resetModules();
+        const dbModuleAfterReload = await import('../../db/index.js');
+        db = dbModuleAfterReload.initDb(dbPath);
+        const limiterAfterReload = await import('../../services/ratelimit.js');
+
+        expect(limiterAfterReload.isProviderOnCooldown('ollama', keyId)).toBe(true);
+      } finally {
+        db?.close();
+        removeDbFile(dbPath);
+      }
+    });
+  });
+
+  describe('provider-wide transient cooldowns', () => {
+    it('blocks the same provider account across all models during cooldown', () => {
+      setProviderCooldown('cloudflare', testId, 60_000);
+      expect(isProviderOnCooldown('cloudflare', testId)).toBe(true);
+      expect(isProviderOnCooldown('cloudflare', testId + 1)).toBe(false);
+      expect(isProviderOnCooldown('google', testId)).toBe(false);
     });
   });
 

@@ -1,7 +1,7 @@
 import { getDb, getSetting, setSetting } from '../db/index.js';
 import { getProvider, resolveProvider } from '../providers/index.js';
 import { decrypt } from '../lib/crypto.js';
-import { canMakeRequest, canUseTokens, isOnCooldown, canUseProvider } from './ratelimit.js';
+import { canMakeRequest, canUseTokens, isOnCooldown, canUseProvider, isProviderOnCooldown } from './ratelimit.js';
 import {
   BANDIT_PRESETS, DEFAULT_STRATEGY, type RoutingStrategy, type RoutingWeights,
   reliabilityPosterior, expectedReliability, sampleBeta,
@@ -59,8 +59,16 @@ export interface RouteResult {
   tpdLimit: number | null;
 }
 
+interface RoutingError extends Error {
+  status?: number;
+  code?: string;
+  maxContextWindow?: number;
+  estimatedTokens?: number;
+}
+
 // Round-robin index per platform
 const roundRobinIndex = new Map<string, number>();
+const learnedContextCeilings = new Map<number, number>();
 
 // ── Dynamic priority: track 429s per model and demote accordingly ──
 // Key: model_db_id → { count, lastHit, penalty }
@@ -98,6 +106,29 @@ export function recordSuccess(modelDbId: number) {
       rateLimitPenalties.delete(modelDbId);
     }
   }
+}
+
+export function recordContextWindowFailure(modelDbId: number, estimatedTokens: number, learnedLimit?: number) {
+  const candidate = Math.max(1, Math.floor(learnedLimit ?? (estimatedTokens - 1)));
+  const existing = learnedContextCeilings.get(modelDbId);
+  if (existing == null || candidate < existing) {
+    learnedContextCeilings.set(modelDbId, candidate);
+  }
+}
+
+export function getEffectiveContextWindow(modelDbId: number, staticContextWindow: number | null): number | null {
+  const learned = learnedContextCeilings.get(modelDbId);
+  if (learned == null) return staticContextWindow;
+  if (staticContextWindow == null) return learned;
+  return Math.min(staticContextWindow, learned);
+}
+
+export function getLearnedContextWindow(modelDbId: number): number | undefined {
+  return learnedContextCeilings.get(modelDbId);
+}
+
+export function resetLearnedContextWindows(): void {
+  learnedContextCeilings.clear();
 }
 
 /**
@@ -383,12 +414,33 @@ function orderChain(chain: ChainRow[], strategy: RoutingStrategy): ChainRow[] {
  *
  * @param estimatedTokens - estimated total tokens for rate limit check
  * @param skipKeys - set of "platform:modelId:keyId" to skip (failed on this request)
+ * @param skipProviders - set of "platform:keyId" to skip across all models on this request
  * @param preferredModelDbId - try this model first (sticky session)
  * @param requireVision - only consider models that accept image input (#118)
  * @param requireTools - only consider models that emit structured tool_calls
  */
-export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, preferredModelDbId?: number, requireVision = false, requireTools = false): RouteResult {
+export function routeRequest(
+  estimatedTokens = 1000,
+  skipKeys?: Set<string>,
+  skipProvidersOrPreferredModelDbId?: Set<string> | number,
+  preferredModelDbIdOrRequireVision?: number | boolean,
+  requireVisionOrRequireTools = false,
+  requireTools = false,
+): RouteResult {
   const db = getDb();
+
+  const skipProviders = skipProvidersOrPreferredModelDbId instanceof Set
+    ? skipProvidersOrPreferredModelDbId
+    : undefined;
+  const preferredModelDbId = typeof skipProvidersOrPreferredModelDbId === 'number'
+    ? skipProvidersOrPreferredModelDbId
+    : (typeof preferredModelDbIdOrRequireVision === 'number' ? preferredModelDbIdOrRequireVision : undefined);
+  const requireVision = typeof preferredModelDbIdOrRequireVision === 'boolean'
+    ? preferredModelDbIdOrRequireVision
+    : requireVisionOrRequireTools;
+  const normalizedRequireTools = typeof preferredModelDbIdOrRequireVision === 'boolean'
+    ? requireVisionOrRequireTools
+    : requireTools;
 
   const strategy = getRoutingStrategy();
   if (strategy !== 'priority') refreshStatsCache(db);
@@ -406,6 +458,8 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
   `).all() as ChainRow[];
 
   const sortedChain = orderChain(chain, strategy);
+  let sawNonContextCandidate = false;
+  let maxRejectedContextWindow: number | null = null;
 
   // Sticky session: move preferred model to front of chain
   if (preferredModelDbId) {
@@ -426,7 +480,7 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
     // looks successful at the transport level while the client's harness sees
     // nothing — worse than a failover. Applies to sticky models too, same
     // reasoning as vision above.
-    if (requireTools && !entry.supports_tools) continue;
+    if (normalizedRequireTools && !entry.supports_tools) continue;
 
     // Context-aware routing: skip a model whose context window can't hold the
     // request, so a large prompt never selects a small-context model and burns
@@ -437,7 +491,13 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
     // failed model is put on cooldown — so this is a fast-path, not the only
     // guard. If every model is too small, the loop falls through and the caller
     // gets the normal "all models exhausted" error rather than a wasted sweep.
-    if (entry.context_window != null && estimatedTokens > entry.context_window) continue;
+    const effectiveContextWindow = getEffectiveContextWindow(entry.model_db_id, entry.context_window);
+    if (effectiveContextWindow != null && estimatedTokens > effectiveContextWindow) {
+      maxRejectedContextWindow = maxRejectedContextWindow == null
+        ? effectiveContextWindow
+        : Math.max(maxRejectedContextWindow, effectiveContextWindow);
+      continue;
+    }
 
     // Check if we have a provider for this platform
     const provider = getProvider(entry.platform as any);
@@ -449,6 +509,7 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
     ).all(entry.platform) as KeyRow[];
 
     if (keys.length === 0) continue;
+    sawNonContextCandidate = true;
 
     // Get limits once for this model
     const limits = {
@@ -474,9 +535,11 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
 
       const skipId = `${entry.platform}:${entry.model_id}:${key.id}`;
       if (skipKeys?.has(skipId)) continue;
+      if (skipProviders?.has(`${entry.platform}:${key.id}`)) continue;
 
       // Check cooldown (from previous 429s)
       if (isOnCooldown(entry.platform, entry.model_id, key.id)) continue;
+      if (isProviderOnCooldown(entry.platform, key.id)) continue;
 
       // Provider-wide daily request cap (#162): providers like OpenRouter cap
       // total requests/day across ALL their models for the account, not per
@@ -527,9 +590,58 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
     // in the sortedChain for THIS specific request.
   }
 
-  const err = new Error('All models exhausted. Add more API keys or wait for rate limits to reset.') as any;
+  if (!sawNonContextCandidate && maxRejectedContextWindow != null) {
+    const err = new Error(
+      `This request needs about ${estimatedTokens} tokens, but the largest available model context window is ${maxRejectedContextWindow} tokens. Reduce the conversation or tool payload, or use a larger-context model.`,
+    ) as RoutingError;
+    err.status = 400;
+    err.code = 'context_length_exceeded';
+    err.maxContextWindow = maxRejectedContextWindow;
+    err.estimatedTokens = estimatedTokens;
+    throw err;
+  }
+
+  const err = new Error('All models exhausted. Add more API keys or wait for rate limits to reset.') as RoutingError;
   err.status = 429;
   throw err;
+}
+
+export function getMaxAvailableContextWindow(requireVision = false, requireTools = false): number | null {
+  const db = getDb();
+  const chain = db.prepare(`
+    SELECT fc.model_db_id,
+           m.platform, m.model_id, m.supports_vision, m.supports_tools, m.context_window
+    FROM fallback_config fc
+    JOIN models m ON m.id = fc.model_db_id AND m.enabled = 1
+    WHERE fc.enabled = 1
+  `).all() as Array<{
+    model_db_id: number;
+    platform: string;
+    model_id: string;
+    supports_vision: number;
+    supports_tools: number;
+    context_window: number | null;
+  }>;
+
+  let maxContext: number | null = null;
+  for (const entry of chain) {
+    if (requireVision && !entry.supports_vision) continue;
+    if (requireTools && !entry.supports_tools) continue;
+
+    const provider = getProvider(entry.platform as any);
+    if (!provider) continue;
+
+    const keys = db.prepare(
+      "SELECT id FROM api_keys WHERE platform = ? AND enabled = 1 AND status IN ('healthy', 'unknown')"
+    ).all(entry.platform) as Array<{ id: number }>;
+    if (keys.length === 0) continue;
+
+    const effectiveContextWindow = getEffectiveContextWindow(entry.model_db_id, entry.context_window);
+    if (effectiveContextWindow == null) return null;
+    maxContext = maxContext == null ? effectiveContextWindow : Math.max(maxContext, effectiveContextWindow);
+  }
+
+  return maxContext;
 }
 
 /**

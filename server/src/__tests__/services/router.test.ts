@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeAll, beforeEach } from 'vitest';
 import { initDb, getDb } from '../../db/index.js';
 import { encrypt } from '../../lib/crypto.js';
-import { routeRequest, setRoutingStrategy } from '../../services/router.js';
+import { routeRequest, setRoutingStrategy, recordContextWindowFailure, resetLearnedContextWindows } from '../../services/router.js';
 
 describe('Router', () => {
   beforeAll(() => {
@@ -11,6 +11,7 @@ describe('Router', () => {
 
   beforeEach(() => {
     const db = getDb();
+    resetLearnedContextWindows();
     // These cases assert the manual priority order specifically; pin it so the
     // bandit (now the default strategy) doesn't reorder by score.
     setRoutingStrategy('priority');
@@ -137,6 +138,53 @@ describe('Router', () => {
     expect(() => routeRequest(500000)).not.toThrow();
   });
 
+  it('throws a 400 context_length_exceeded error when every usable model is too small', () => {
+    const db = getDb();
+    const groqKey = encrypt('test-groq-key');
+    db.prepare(`
+      INSERT INTO api_keys (platform, label, encrypted_key, iv, auth_tag, status, enabled)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run('groq', 'test', groqKey.encrypted, groqKey.iv, groqKey.authTag, 'healthy', 1);
+    const originals = db.prepare("SELECT id, context_window, tpm_limit, tpd_limit FROM models WHERE platform = 'groq'").all() as Array<{
+      id: number;
+      context_window: number | null;
+      tpm_limit: number | null;
+      tpd_limit: number | null;
+    }>;
+    const restore = db.prepare('UPDATE models SET context_window = ?, tpm_limit = ?, tpd_limit = ? WHERE id = ?');
+
+    try {
+      db.prepare("UPDATE models SET tpm_limit = NULL, tpd_limit = NULL, context_window = 100 WHERE platform = 'groq'").run();
+      routeRequest(1000);
+      throw new Error('expected routeRequest to throw');
+    } catch (err: any) {
+      expect(err.status).toBe(400);
+      expect(err.code).toBe('context_length_exceeded');
+      expect(err.maxContextWindow).toBe(100);
+      expect(err.message).toMatch(/largest available model context window is 100 tokens/i);
+    } finally {
+      for (const row of originals) {
+        restore.run(row.context_window, row.tpm_limit, row.tpd_limit, row.id);
+      }
+    }
+  });
+
+  it('learns a lower effective context ceiling after a provider context-limit failure', () => {
+    const db = getDb();
+    const groqKey = encrypt('test-groq-key');
+    db.prepare(`
+      INSERT INTO api_keys (platform, label, encrypted_key, iv, auth_tag, status, enabled)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run('groq', 'test', groqKey.encrypted, groqKey.iv, groqKey.authTag, 'healthy', 1);
+    db.prepare("UPDATE models SET tpm_limit = NULL, tpd_limit = NULL WHERE platform = 'groq'").run();
+
+    const baseline = routeRequest(5000);
+    recordContextWindowFailure(baseline.modelDbId, 5000, 4096);
+
+    expect(routeRequest(4000).modelDbId).toBe(baseline.modelDbId);
+    expect(routeRequest(5000).modelDbId).not.toBe(baseline.modelDbId);
+  });
+
   it('should skip keys that cannot be decrypted and use a valid fallback key', () => {
     const db = getDb();
 
@@ -157,5 +205,26 @@ describe('Router', () => {
     expect(result.platform).toBe('groq');
     expect(result.apiKey).toBe('test-groq-key');
     expect(corruptKey.status).toBe('error');
+  });
+
+  it('skips an entire provider key across all models when requested', () => {
+    const db = getDb();
+
+    const googleKey = encrypt('test-google-key');
+    const googleInsert = db.prepare(`
+      INSERT INTO api_keys (platform, label, encrypted_key, iv, auth_tag, status, enabled)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run('google', 'test', googleKey.encrypted, googleKey.iv, googleKey.authTag, 'healthy', 1);
+
+    const groqKey = encrypt('test-groq-key');
+    db.prepare(`
+      INSERT INTO api_keys (platform, label, encrypted_key, iv, auth_tag, status, enabled)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run('groq', 'test', groqKey.encrypted, groqKey.iv, groqKey.authTag, 'healthy', 1);
+
+    const skippedProvider = new Set([`google:${Number(googleInsert.lastInsertRowid)}`]);
+    const result = routeRequest(1000, undefined, skippedProvider);
+
+    expect(result.platform).toBe('groq');
   });
 });

@@ -8,15 +8,22 @@ import type {
   ChatToolDefinition,
   ChatToolChoice,
 } from '@freellmapi/shared/types.js';
-import { routeRequest, recordRateLimitHit, recordSuccess, hasEnabledToolsModel, type RouteResult } from '../services/router.js';
-import { recordRequest, recordTokens, setCooldown, getCooldownDurationForLimit, PAYMENT_REQUIRED_COOLDOWN_MS } from '../services/ratelimit.js';
+import { routeRequest, recordRateLimitHit, recordSuccess, recordContextWindowFailure, getLearnedContextWindow, getMaxAvailableContextWindow, hasEnabledToolsModel, type RouteResult } from '../services/router.js';
+import { recordRequest, recordTokens, setCooldown, setProviderCooldown, getCooldownDurationForLimit, PAYMENT_REQUIRED_COOLDOWN_MS } from '../services/ratelimit.js';
 import { getUnifiedApiKey } from '../db/index.js';
 import { contentToString } from '../lib/content.js';
+import { estimateChatRequestTokens } from '../lib/request-estimate.js';
+import { compactChatHistory } from '../lib/history-compact.js';
 import { repairToolArguments, toolSchemaMap } from '../lib/tool-args.js';
 import { rescueInlineToolCalls, startsWithDialectMarker, couldBecomeDialectMarker, containsDialectMarker } from '../lib/tool-call-rescue.js';
 import {
   isRetryableError,
   isPaymentRequiredError,
+  shouldSkipProviderOnRetry,
+  shouldCooldownOnRetry,
+  shouldProviderCooldownOnRetry,
+  isContextWindowError,
+  parseContextWindowLimit,
   timingSafeStringEqual,
   extractApiToken,
   getStickyModel,
@@ -297,7 +304,8 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
   }
 
   const stream = reqData.stream ?? false;
-  const messages = toChatMessages(reqData);
+  const originalMessages = toChatMessages(reqData);
+  let messages = originalMessages;
   const tools = toChatTools(reqData.tools);
   // name → parameter schema, for repairing double-encoded tool arguments on
   // the way back out (see lib/tool-args.ts).
@@ -312,11 +320,14 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
     parallel_tool_calls: reqData.parallel_tool_calls ?? undefined,
   };
 
-  const estimatedInputTokens = messages.reduce(
-    (sum, m) => sum + Math.ceil(contentToString(m.content).length / 4),
-    0,
-  );
-  const estimatedTotal = estimatedInputTokens + (reqData.max_output_tokens ?? 1000);
+  let { inputTokens: estimatedInputTokens, totalTokens: estimatedTotal } = estimateChatRequestTokens({
+    messages: messages as Array<Record<string, unknown>>,
+    maxOutputTokens: reqData.max_output_tokens ?? undefined,
+    tools,
+    toolChoice: tool_choice,
+    parallelToolCalls: reqData.parallel_tool_calls,
+    extraPayload: reqData.tools ? [reqData.tools] : undefined,
+  });
   // Optional client-managed session affinity (mirrors /chat/completions).
   const rawSessionId = req.headers['x-session-id'];
   const sessionIdHeader = Array.isArray(rawSessionId) ? rawSessionId[0] : rawSessionId;
@@ -338,8 +349,30 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
     return;
   }
 
+  const maxAvailableContext = getMaxAvailableContextWindow(false, wantsTools);
+  const compaction = maxAvailableContext != null
+    ? compactChatHistory({
+        messages,
+        maxContextWindow: maxAvailableContext,
+        maxOutputTokens: reqData.max_output_tokens ?? undefined,
+        tools,
+        toolChoice: tool_choice,
+        parallelToolCalls: reqData.parallel_tool_calls,
+        extraPayload: reqData.tools ? [reqData.tools] : undefined,
+      })
+    : null;
+  if (compaction?.compressed) {
+    messages = compaction.messages;
+    estimatedInputTokens = compaction.compressedInputTokens;
+    estimatedTotal = compaction.compressedTotalTokens;
+    console.log(
+      `[Responses] Compacted history from ${compaction.originalInputTokens} to ${compaction.compressedInputTokens} input tokens by dropping ${compaction.omittedMessages} older message(s)`,
+    );
+  }
+
   const responseId = newId('resp');
   const skipKeys = new Set<string>();
+  const skipProviders = new Set<string>();
   let lastError: any = null;
 
   // Stream bookkeeping (used only when stream === true).
@@ -351,20 +384,57 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
   };
 
   for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
-    let route: RouteResult;
+    let route: RouteResult | undefined;
     try {
-      route = routeRequest(estimatedTotal, skipKeys.size > 0 ? skipKeys : undefined, preferredModel, false, wantsTools);
+      route = routeRequest(
+        estimatedTotal,
+        skipKeys.size > 0 ? skipKeys : undefined,
+        skipProviders.size > 0 ? skipProviders : undefined,
+        preferredModel,
+        false,
+        wantsTools,
+      );
     } catch (err: any) {
-      const status = lastError ? 429 : (err.status ?? 503);
+      const status = lastError
+        ? (isContextWindowError(lastError) ? 400 : 429)
+        : (err.status ?? 503);
       const message = lastError
-        ? `All models rate-limited. Last error: ${lastError.message}`
+        ? (isContextWindowError(lastError) ? lastError.message : `All models rate-limited. Last error: ${lastError.message}`)
         : err.message;
-      const type = lastError ? 'rate_limit_error' : 'routing_error';
+      const type = lastError
+        ? (isContextWindowError(lastError) ? 'invalid_request_error' : 'rate_limit_error')
+        : (err.status === 429 ? 'rate_limit_error' : err.status === 400 && err.code === 'context_length_exceeded' ? 'invalid_request_error' : 'routing_error');
+      const error = {
+        message,
+        type,
+        ...(type === 'invalid_request_error' ? { code: 'context_length_exceeded' } : {}),
+      };
       if (streamStarted) {
-        sse('response.failed', { response: { id: responseId, object: 'response', status: 'failed', error: { message, type } } });
+        sse('response.failed', { response: { id: responseId, object: 'response', status: 'failed', error } });
         res.end();
       } else {
-        res.status(status).json({ error: { message, type } });
+        res.status(status).json({ error });
+      }
+      return;
+    }
+
+    if (!route) {
+      const message = lastError
+        ? (isContextWindowError(lastError) ? lastError.message : `All models rate-limited. Last error: ${lastError.message}`)
+        : 'Routing failed: no provider was selected for this request.';
+      const type = lastError
+        ? (isContextWindowError(lastError) ? 'invalid_request_error' : 'rate_limit_error')
+        : 'routing_error';
+      const error = {
+        message,
+        type,
+        ...(type === 'invalid_request_error' ? { code: 'context_length_exceeded' } : {}),
+      };
+      if (streamStarted) {
+        sse('response.failed', { response: { id: responseId, object: 'response', status: 'failed', error } });
+        res.end();
+      } else {
+        res.status(lastError ? (isContextWindowError(lastError) ? 400 : 429) : 503).json({ error });
       }
       return;
     }
@@ -432,6 +502,7 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
             res.setHeader('Connection', 'keep-alive');
             res.setHeader('X-Routed-Via', `${route.platform}/${route.modelId}`);
             if (attempt > 0) res.setHeader('X-Fallback-Attempts', String(attempt));
+            if (compaction?.compressed) res.setHeader('X-History-Compacted', String(compaction.omittedMessages));
             const skeleton = {
               id: responseId, object: 'response', created_at: nowUnix(),
               status: 'in_progress', model: route.modelId, output: [], output_text: '',
@@ -586,7 +657,7 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
 
         recordTokens(route.platform, route.modelId, route.keyId, estimatedInputTokens + totalOutputTokens);
         recordSuccess(route.modelDbId);
-        setStickyModel(messages, route.modelDbId, sessionIdHeader);
+        setStickyModel(originalMessages, route.modelDbId, sessionIdHeader);
         logRequest(route.platform, route.modelId, route.keyId, 'success', estimatedInputTokens, totalOutputTokens, Date.now() - start, null);
         return;
       } else {
@@ -630,10 +701,11 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
 
         recordTokens(route.platform, route.modelId, route.keyId, result.usage?.total_tokens ?? 0);
         recordSuccess(route.modelDbId);
-        setStickyModel(messages, route.modelDbId, sessionIdHeader);
+        setStickyModel(originalMessages, route.modelDbId, sessionIdHeader);
 
         res.setHeader('X-Routed-Via', `${route.platform}/${route.modelId}`);
         if (attempt > 0) res.setHeader('X-Fallback-Attempts', String(attempt));
+        if (compaction?.compressed) res.setHeader('X-History-Compacted', String(compaction.omittedMessages));
         res.json(buildResponseObject({
           id: responseId, model: route.modelId, text, toolCalls,
           promptTokens, completionTokens,
@@ -656,9 +728,32 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
 
       if (isRetryableError(err)) {
         skipKeys.add(`${route.platform}:${route.modelId}:${route.keyId}`);
-        setCooldown(route.platform, route.modelId, route.keyId, isPaymentRequiredError(err)
-          ? PAYMENT_REQUIRED_COOLDOWN_MS
-          : getCooldownDurationForLimit(route.platform, route.modelId, route.keyId, { rpd: route.rpdLimit, tpd: route.tpdLimit }));
+        if (isContextWindowError(err)) {
+          const parsedLimit = parseContextWindowLimit(err);
+          recordContextWindowFailure(
+            route.modelDbId,
+            estimatedTotal,
+            parsedLimit,
+          );
+          const learnedLimit = getLearnedContextWindow(route.modelDbId);
+          console.log(
+            `[Responses] Learned context ceiling ${learnedLimit ?? 'unknown'} for ${route.displayName} after estimated ${estimatedTotal} tokens`,
+          );
+        }
+        if (shouldSkipProviderOnRetry(err, route.platform)) {
+          skipProviders.add(`${route.platform}:${route.keyId}`);
+        }
+        if (shouldProviderCooldownOnRetry(err, route.platform)) {
+          const cooldownMs = isPaymentRequiredError(err)
+            ? PAYMENT_REQUIRED_COOLDOWN_MS
+            : getCooldownDurationForLimit(route.platform, route.modelId, route.keyId, { rpd: route.rpdLimit, tpd: route.tpdLimit });
+          setProviderCooldown(route.platform, route.keyId, cooldownMs);
+        }
+        if (shouldCooldownOnRetry(err, route.platform)) {
+          setCooldown(route.platform, route.modelId, route.keyId, isPaymentRequiredError(err)
+            ? PAYMENT_REQUIRED_COOLDOWN_MS
+            : getCooldownDurationForLimit(route.platform, route.modelId, route.keyId, { rpd: route.rpdLimit, tpd: route.tpdLimit }));
+        }
         recordRateLimitHit(route.modelDbId);
         lastError = err;
         continue;
@@ -674,6 +769,16 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
   // streamStarted) — close the SSE stream with a failed event instead of
   // writing JSON onto a committed event-stream response.
   const exhaustedMsg = `All models rate-limited after ${MAX_RETRIES} attempts. Last: ${lastError?.message}`;
+  if (isContextWindowError(lastError)) {
+    const error = { message: lastError.message, type: 'invalid_request_error', code: 'context_length_exceeded' };
+    if (streamStarted) {
+      sse('response.failed', { response: { id: responseId, object: 'response', status: 'failed', error } });
+      res.end();
+      return;
+    }
+    res.status(400).json({ error });
+    return;
+  }
   if (streamStarted) {
     sse('response.failed', { response: { id: responseId, object: 'response', status: 'failed', error: { message: exhaustedMsg, type: 'rate_limit_error' } } });
     res.end();

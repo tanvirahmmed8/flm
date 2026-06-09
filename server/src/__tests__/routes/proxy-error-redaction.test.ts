@@ -69,15 +69,17 @@ describe('Provider error redaction', () => {
     vi.spyOn(global, 'fetch').mockImplementation(async (url, init) => {
       const urlStr = typeof url === 'string' ? url : url.toString();
       if (urlStr.includes('api.groq.com/openai/v1/chat/completions')) {
+        const payload = {
+          error: {
+            message: `Invalid Bearer ${leakedKey} for ${leakedUrl}`,
+          },
+        };
         return {
           ok: false,
           status: 401,
           statusText: 'Unauthorized',
-          json: () => Promise.resolve({
-            error: {
-              message: `Invalid Bearer ${leakedKey} for ${leakedUrl}`,
-            },
-          }),
+          text: () => Promise.resolve(JSON.stringify(payload)),
+          json: () => Promise.resolve(payload),
         } as any;
       }
       return origFetch(url, init);

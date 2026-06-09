@@ -116,7 +116,18 @@ function toGeminiTools(tools?: ChatToolDefinition[]): Array<{ functionDeclaratio
     functionDeclarations: tools.map(t => ({
       name: t.function.name,
       description: t.function.description,
-      parameters: sanitizeForGemini(t.function.parameters),
+      // Prefer the newer JSON-Schema field when available. Copilot / Codex
+      // tool definitions regularly include draft-style keywords that Google's
+      // older `parameters` Schema field rejects with
+      // "Invalid JSON payload received. Unknown name ...".
+      //
+      // `parametersJsonSchema` is the documented escape hatch for richer JSON
+      // Schema payloads, so agent/codebase-mode tools can flow through without
+      // lossy sanitization. Keep the older sanitized `parameters` fallback for
+      // empty/legacy tool definitions that never supplied a schema object.
+      ...(t.function.parameters
+        ? { parametersJsonSchema: t.function.parameters }
+        : { parameters: sanitizeForGemini(t.function.parameters) }),
     })),
   }];
 }
@@ -235,6 +246,16 @@ async function toGeminiContents(messages: ChatMessage[]) {
         }
 
         for (const call of m.tool_calls ?? []) {
+          // Gemini accepts replayed model tool calls only when they carry the
+          // provider-issued thought signature from a prior Gemini response.
+          // Agent histories frequently contain tool calls produced by Groq /
+          // Cloudflare / OpenAI-compatible backends, which have no
+          // thought_signature at all. Forwarding those verbatim triggers
+          // "Function call is missing a thought_sig" 400s on the next Gemini
+          // turn, so we omit the incompatible replay rather than poisoning the
+          // whole request. The paired tool result message still carries the
+          // tool output as plain history.
+          if (!call.thought_signature) continue;
           parts.push({
             thoughtSignature: call.thought_signature,
             functionCall: {

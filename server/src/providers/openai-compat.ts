@@ -73,8 +73,7 @@ export class OpenAICompatProvider extends BaseProvider {
     }, this.timeoutMs);
 
     if (!res.ok) {
-      const err = await res.json().catch(() => ({}));
-      throw new Error(`${this.name} API error ${res.status}: ${(err as any).error?.message ?? res.statusText}`);
+      throw new Error(await this.buildErrorMessage(res));
     }
 
     let data: ChatCompletionResponse;
@@ -122,8 +121,7 @@ export class OpenAICompatProvider extends BaseProvider {
     }, this.timeoutMs);
 
     if (!res.ok) {
-      const err = await res.json().catch(() => ({}));
-      throw new Error(`${this.name} API error ${res.status}: ${(err as any).error?.message ?? res.statusText}`);
+      throw new Error(await this.buildErrorMessage(res));
     }
 
     yield* this.readSseStream(res);
@@ -147,6 +145,33 @@ export class OpenAICompatProvider extends BaseProvider {
       },
     }, 30000);
     return res.status !== 401 && res.status !== 403;
+  }
+
+  private async buildErrorMessage(res: Response): Promise<string> {
+    const raw = await res.text().catch(() => '');
+    let message: string | undefined;
+
+    if (raw) {
+      try {
+        const parsed = JSON.parse(raw) as any;
+        message =
+          parsed?.error?.message
+          ?? parsed?.message
+          ?? parsed?.detail
+          ?? parsed?.error?.detail
+          ?? parsed?.error_description
+          ?? parsed?.title;
+      } catch {
+        // Non-JSON error body — keep a trimmed preview instead of losing it to
+        // a generic statusText such as "Bad Request".
+        message = raw.trim();
+      }
+    }
+
+    const detail = typeof message === 'string' && message.trim().length > 0
+      ? message.trim().replace(/\s+/g, ' ').slice(0, 300)
+      : res.statusText;
+    return `${this.name} API error ${res.status}: ${detail}`;
   }
 }
 

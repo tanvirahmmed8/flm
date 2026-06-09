@@ -3,12 +3,14 @@ import { Router } from 'express';
 import type { Request, Response } from 'express';
 import { z } from 'zod';
 import type { ChatMessage, ModelListRow } from '@freellmapi/shared/types.js';
-import { routeRequest, recordRateLimitHit, recordSuccess, hasEnabledVisionModel, hasEnabledToolsModel, type RouteResult } from '../services/router.js';
-import { recordRequest, recordTokens, setCooldown, getCooldownDurationForLimit, PAYMENT_REQUIRED_COOLDOWN_MS } from '../services/ratelimit.js';
+import { routeRequest, recordRateLimitHit, recordSuccess, recordContextWindowFailure, getLearnedContextWindow, getMaxAvailableContextWindow, hasEnabledVisionModel, hasEnabledToolsModel, type RouteResult } from '../services/router.js';
+import { recordRequest, recordTokens, setCooldown, setProviderCooldown, getCooldownDurationForLimit, PAYMENT_REQUIRED_COOLDOWN_MS } from '../services/ratelimit.js';
 import { pruneRequestAnalytics } from '../services/request-retention.js';
 import { runEmbeddings, EmbeddingsError } from '../services/embeddings.js';
 import { getDb, getUnifiedApiKey } from '../db/index.js';
 import { contentToString, messageHasImage, normalizeOutboundContent } from '../lib/content.js';
+import { estimateChatRequestTokens } from '../lib/request-estimate.js';
+import { compactChatHistory } from '../lib/history-compact.js';
 import { repairToolArguments, toolSchemaMap } from '../lib/tool-args.js';
 import { sanitizeProviderErrorMessage } from '../lib/error-redaction.js';
 import { rescueInlineToolCalls, startsWithDialectMarker, couldBecomeDialectMarker, containsDialectMarker } from '../lib/tool-call-rescue.js';
@@ -344,6 +346,105 @@ export function isPaymentRequiredError(err: any): boolean {
     || msg.includes('insufficient balance');
 }
 
+// Some retryable failures are request-scoped across a provider account, not a
+// single model: provider-wide 429/402 quotas, schema/feature 400s, and
+// transport aborts/timeouts. When these happen, retrying a different model on
+// the SAME provider often just burns more attempts on the same broken account.
+// Model-specific failures like 404/413/empty-completion stay model-local.
+export function shouldSkipProviderOnRetry(err: any, platform?: string): boolean {
+  const msg = (err.message ?? '').toLowerCase();
+  return isPaymentRequiredError(err)
+    || msg.includes('429')
+    || msg.includes('too many requests')
+    || msg.includes('rate limit')
+    || msg.includes('quota')
+    || msg.includes('resource_exhausted')
+    || msg.includes('api error 400')
+    || msg.includes('aborted')
+    || msg.includes('timeout')
+    || msg.includes('etimedout')
+    || msg.includes('econnrefused')
+    || msg.includes('econnreset')
+    // GitHub Models' 413 is typically a gateway/body-size rejection for the
+    // whole provider request, not one model's context ceiling. Retrying other
+    // GitHub models on the same payload just burns attempts that could have
+    // moved to another provider with a larger ingress limit.
+    || (platform === 'github' && (
+      msg.includes('413')
+      || msg.includes('payload too large')
+      || msg.includes('request body too large')
+      || msg.includes('request entity too large')
+      || msg.includes('content too large')
+    ));
+}
+
+// Some retryable failures should be skipped only for THIS request, not benched
+// globally for the next few minutes. Large Copilot agent turns commonly trip
+// provider ingress/body-size limits (413) or provider-specific request-shape
+// validation (OpenAI-compat 400) while smaller follow-up turns would work
+// immediately. Cooling those providers down makes the next request look
+// artificially "exhausted".
+export function shouldCooldownOnRetry(err: any, platform?: string): boolean {
+  const msg = (err.message ?? '').toLowerCase();
+  if (msg.includes('api error 400')) return false;
+  if (
+    msg.includes('413')
+    || msg.includes('payload too large')
+    || msg.includes('request body too large')
+    || msg.includes('request entity too large')
+    || msg.includes('content too large')
+  ) {
+    return false;
+  }
+  return true;
+}
+
+export function shouldProviderCooldownOnRetry(err: any, platform?: string): boolean {
+  return shouldSkipProviderOnRetry(err, platform) && shouldCooldownOnRetry(err, platform);
+}
+
+export function parseContextWindowLimit(err: any): number | undefined {
+  const msg = String(err?.message ?? '');
+  const patterns = [
+    /maximum context (?:length|len(?:gth)?)\D+(\d[\d,]*)/i,
+    /maximum context [^.]*? is [^\d]*(\d[\d,]*)\s+tokens/i,
+    /context window\D+(\d[\d,]*)/i,
+    /context limit\D+(\d[\d,]*)/i,
+    /max(?:imum)? input tokens\D+(\d[\d,]*)/i,
+    /maximum number of tokens[^0-9]*(\d[\d,]*)/i,
+    /supports up to[^0-9]*(\d[\d,]*)\s+tokens/i,
+  ];
+  for (const pattern of patterns) {
+    const match = pattern.exec(msg);
+    if (!match) continue;
+    const parsed = Number(match[1].replace(/,/g, ''));
+    if (Number.isFinite(parsed) && parsed > 0) return parsed;
+  }
+  return undefined;
+}
+
+export function isContextWindowError(err: any): boolean {
+  const msg = String(err?.message ?? '').toLowerCase();
+  return msg.includes('maximum context')
+    || msg.includes('context length')
+    || msg.includes('context window')
+    || msg.includes('context limit')
+    || msg.includes('prompt is too long')
+    || msg.includes('too many tokens')
+    || msg.includes('token limit')
+    || msg.includes('maximum number of tokens');
+}
+
+function contextWindowClientError(message: string) {
+  return {
+    error: {
+      message: sanitizeProviderErrorMessage(message),
+      type: 'invalid_request_error',
+      code: 'context_length_exceeded',
+    },
+  };
+}
+
 // Pull the incremental text out of a streaming chunk for token counting.
 // Must tolerate chunks that carry no `choices` array at all: some providers
 // (e.g. Groq) emit usage/keepalive frames shaped like `{usage:{...}}` with no
@@ -453,7 +554,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
     return pendingToolCallIds.shift() ?? `call_auto_${++syntheticIdCounter}`;
   };
 
-  const messages: ChatMessage[] = parsed.data.messages.map((m): ChatMessage => {
+  const originalMessages: ChatMessage[] = parsed.data.messages.map((m): ChatMessage => {
     if (m.role === 'assistant') {
       const hasToolCalls = (m.tool_calls?.length ?? 0) > 0;
       // With tool_calls, content: null is the correct OpenAI shape — keep it.
@@ -524,16 +625,12 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   // Non-streaming requests reconcile against the provider's real `usage` block
   // (see line ~340). Streaming will drift from real consumption — accepted
   // tradeoff because per-request usage isn't always returned mid-stream.
-  const estimatedInputTokens = messages.reduce((sum, m) => {
-    const text = contentToString(m.content);
-    return sum + Math.ceil(text.length / 4);
-  }, 0);
-
   // Image requests must route to a vision-capable model. Reject up front with a
   // clear message when none is enabled, rather than silently dropping the image
   // or surfacing the generic "all models exhausted" error (#118, #125). Add a
   // rough per-image token cost so budget routing isn't skewed by content the
   // heuristic above (text-only) can't see.
+  let messages = originalMessages;
   const hasImage = messageHasImage(messages);
   if (hasImage && !hasEnabledVisionModel()) {
     res.status(422).json({
@@ -545,11 +642,13 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
     });
     return;
   }
-  const IMAGE_TOKEN_ESTIMATE = 1000;
-  const imageCount = messages.reduce((n, m) =>
-    n + (Array.isArray(m.content) ? m.content.filter(b => (b as { type?: string })?.type === 'image_url' || (b as { type?: string })?.type === 'image').length : 0), 0);
-  const estimatedTotal = estimatedInputTokens + imageCount * IMAGE_TOKEN_ESTIMATE + (max_tokens ?? 1000);
-
+  let { inputTokens: estimatedInputTokens, totalTokens: estimatedTotal } = estimateChatRequestTokens({
+    messages: messages as unknown as Array<Record<string, unknown>>,
+    maxOutputTokens: max_tokens,
+    tools,
+    toolChoice: tool_choice,
+    parallelToolCalls: parallel_tool_calls,
+  });
   // Tool-bearing requests must route to a model that emits STRUCTURED
   // tool_calls. A model without real function-calling support serializes the
   // call into its text answer — the request "succeeds" but the client's tool
@@ -567,6 +666,26 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
     return;
   }
 
+  const maxAvailableContext = getMaxAvailableContextWindow(hasImage, wantsTools);
+  const compaction = maxAvailableContext != null
+    ? compactChatHistory({
+        messages,
+        maxContextWindow: maxAvailableContext,
+        maxOutputTokens: max_tokens,
+        tools,
+        toolChoice: tool_choice,
+        parallelToolCalls: parallel_tool_calls,
+      })
+    : null;
+  if (compaction?.compressed) {
+    messages = compaction.messages;
+    estimatedInputTokens = compaction.compressedInputTokens;
+    estimatedTotal = compaction.compressedTotalTokens;
+    console.log(
+      `[Proxy] Compacted history from ${compaction.originalInputTokens} to ${compaction.compressedInputTokens} input tokens by dropping ${compaction.omittedMessages} older message(s)`,
+    );
+  }
+
   // Optional client-managed session affinity (see getSessionKey). Express
   // lower-cases header names; a repeated header arrives as an array — take
   // the first value.
@@ -580,7 +699,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   let preferredModel: number | undefined;
   if (isAutoModel(requestedModel)) {
     // Explicit "auto" → behave exactly like an omitted model field.
-    preferredModel = getStickyModel(messages, sessionIdHeader);
+    preferredModel = getStickyModel(originalMessages, sessionIdHeader);
   } else if (requestedModel) {
     const db = getDb();
     const enabled = db.prepare('SELECT id FROM models WHERE model_id = ? AND enabled = 1').get(requestedModel) as { id: number } | undefined;
@@ -599,7 +718,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
       return;
     }
   } else {
-    preferredModel = getStickyModel(messages, sessionIdHeader);
+    preferredModel = getStickyModel(originalMessages, sessionIdHeader);
   }
 
   // For analytics: the model id the client pinned, null when auto-routed
@@ -609,25 +728,60 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
 
   // Retry loop: on 429/rate limit, skip that model+key and try the next one
   const skipKeys = new Set<string>();
+  const skipProviders = new Set<string>();
   let lastError: any = null;
 
   for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
-    let route: RouteResult;
+    let route: RouteResult | undefined;
     try {
-      route = routeRequest(estimatedTotal, skipKeys.size > 0 ? skipKeys : undefined, preferredModel, hasImage, wantsTools);
-    } catch (err: any) {
-      // No more models available
+      route = routeRequest(
+        estimatedTotal,
+        skipKeys.size > 0 ? skipKeys : undefined,
+        skipProviders.size > 0 ? skipProviders : undefined,
+        preferredModel,
+        hasImage,
+        wantsTools,
+      );
+      } catch (err: any) {
+        // No more models available
+        if (lastError) {
+          if (isContextWindowError(lastError)) {
+            res.status(400).json(contextWindowClientError(lastError.message));
+          } else {
+            const safeLastError = sanitizeProviderErrorMessage(lastError.message);
+            res.status(429).json({
+              error: {
+                message: `All models rate-limited. Last error: ${safeLastError}`,
+                type: 'rate_limit_error',
+              },
+            });
+          }
+        } else {
+          if (err.status === 400 && err.code === 'context_length_exceeded') {
+            res.status(400).json(contextWindowClientError(err.message));
+          } else {
+            const type = err.status === 429 ? 'rate_limit_error' : 'routing_error';
+            res.status(err.status ?? 503).json({
+              error: { message: err.message, type },
+            });
+          }
+        }
+        return;
+      }
+
+    if (!route) {
       if (lastError) {
-        const safeLastError = sanitizeProviderErrorMessage(lastError.message);
-        res.status(429).json({
-          error: {
-            message: `All models rate-limited. Last error: ${safeLastError}`,
-            type: 'rate_limit_error',
-          },
-        });
+        if (isContextWindowError(lastError)) {
+          res.status(400).json(contextWindowClientError(lastError.message));
+        } else {
+          const safeLastError = sanitizeProviderErrorMessage(lastError.message);
+          res.status(429).json({
+            error: { message: `All models rate-limited. Last: ${safeLastError}`, type: 'rate_limit_error' },
+          });
+        }
       } else {
-        res.status(err.status ?? 503).json({
-          error: { message: err.message, type: 'routing_error' },
+        res.status(503).json({
+          error: { message: 'Routing failed: no provider was selected for this request.', type: 'routing_error' },
         });
       }
       return;
@@ -676,6 +830,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
           res.setHeader('Connection', 'keep-alive');
           res.setHeader('X-Routed-Via', `${route.platform}/${route.modelId}`);
           if (attempt > 0) res.setHeader('X-Fallback-Attempts', String(attempt));
+          if (compaction?.compressed) res.setHeader('X-History-Compacted', String(compaction.omittedMessages));
           headerSent = true;
           for (const p of preamble) res.write(`data: ${JSON.stringify(p)}\n\n`);
           preamble.length = 0;
@@ -836,7 +991,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
 
           recordTokens(route.platform, route.modelId, route.keyId, estimatedInputTokens + totalOutputTokens);
           recordSuccess(route.modelDbId);
-          setStickyModel(messages, route.modelDbId, sessionIdHeader);
+          setStickyModel(originalMessages, route.modelDbId, sessionIdHeader);
           logRequest(route.platform, route.modelId, route.keyId, 'success', estimatedInputTokens, totalOutputTokens, Date.now() - start, null, ttfbMs, pinnedModelId);
           return;
         } catch (streamErr: any) {
@@ -903,10 +1058,11 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         const totalTokens = result.usage?.total_tokens ?? 0;
         recordTokens(route.platform, route.modelId, route.keyId, totalTokens);
         recordSuccess(route.modelDbId);
-        setStickyModel(messages, route.modelDbId, sessionIdHeader);
+        setStickyModel(originalMessages, route.modelDbId, sessionIdHeader);
 
         res.setHeader('X-Routed-Via', `${route.platform}/${route.modelId}`);
         if (attempt > 0) res.setHeader('X-Fallback-Attempts', String(attempt));
+        if (compaction?.compressed) res.setHeader('X-History-Compacted', String(compaction.omittedMessages));
         // Repair double-encoded tool arguments against the request's tool
         // schemas (e.g. GLM emitting an array parameter as a JSON string),
         // so strict clients don't reject the call. Schema-gated — a true
@@ -935,24 +1091,50 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
       const safeError = sanitizeProviderErrorMessage(err.message);
       logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, latency, safeError, null, pinnedModelId);
 
-      if (isRetryableError(err)) {
-        // Put this model+key on cooldown and try the next one
-        const skipId = `${route.platform}:${route.modelId}:${route.keyId}`;
-        skipKeys.add(skipId);
-        setCooldown(
-          route.platform,
-          route.modelId,
-          route.keyId,
-          isPaymentRequiredError(err)
-            ? PAYMENT_REQUIRED_COOLDOWN_MS
-            : getCooldownDurationForLimit(route.platform, route.modelId, route.keyId, {
-                rpd: route.rpdLimit,
-                tpd: route.tpdLimit,
-              }),
-        );
+        if (isRetryableError(err)) {
+          // Put this model+key on cooldown and try the next one
+          const skipId = `${route.platform}:${route.modelId}:${route.keyId}`;
+          skipKeys.add(skipId);
+          if (isContextWindowError(err)) {
+            const parsedLimit = parseContextWindowLimit(err);
+            recordContextWindowFailure(
+              route.modelDbId,
+              estimatedTotal,
+              parsedLimit,
+            );
+            const learnedLimit = getLearnedContextWindow(route.modelDbId);
+            console.log(
+              `[Proxy] Learned context ceiling ${learnedLimit ?? 'unknown'} for ${route.displayName} after estimated ${estimatedTotal} tokens`,
+            );
+          }
+          if (shouldSkipProviderOnRetry(err, route.platform)) {
+            skipProviders.add(`${route.platform}:${route.keyId}`);
+          }
+          if (shouldProviderCooldownOnRetry(err, route.platform)) {
+            const cooldownMs = isPaymentRequiredError(err)
+              ? PAYMENT_REQUIRED_COOLDOWN_MS
+              : getCooldownDurationForLimit(route.platform, route.modelId, route.keyId, {
+                  rpd: route.rpdLimit,
+                  tpd: route.tpdLimit,
+                });
+            setProviderCooldown(route.platform, route.keyId, cooldownMs);
+          }
+          if (shouldCooldownOnRetry(err, route.platform)) {
+            setCooldown(
+              route.platform,
+              route.modelId,
+              route.keyId,
+              isPaymentRequiredError(err)
+                ? PAYMENT_REQUIRED_COOLDOWN_MS
+                : getCooldownDurationForLimit(route.platform, route.modelId, route.keyId, {
+                    rpd: route.rpdLimit,
+                    tpd: route.tpdLimit,
+                  }),
+            );
+        }
         recordRateLimitHit(route.modelDbId);
         lastError = err;
-        console.log(`[Proxy] ${safeError.slice(0, 60)} from ${route.displayName}, falling back (attempt ${attempt + 1}/${MAX_RETRIES})`);
+        console.log(`[Proxy] ${safeError.slice(0, 160)} from ${route.displayName}, falling back (attempt ${attempt + 1}/${MAX_RETRIES})`);
         continue;
       }
 
@@ -968,12 +1150,16 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   }
 
   // Exhausted all retries
-  res.status(429).json({
-    error: {
-      message: `All models rate-limited after ${MAX_RETRIES} attempts. Last: ${sanitizeProviderErrorMessage(lastError?.message)}`,
-      type: 'rate_limit_error',
-    },
-  });
+  if (isContextWindowError(lastError)) {
+    res.status(400).json(contextWindowClientError(lastError.message));
+  } else {
+    res.status(429).json({
+      error: {
+        message: `All models rate-limited after ${MAX_RETRIES} attempts. Last: ${sanitizeProviderErrorMessage(lastError?.message)}`,
+        type: 'rate_limit_error',
+      },
+    });
+  }
 });
 
 export function logRequest(

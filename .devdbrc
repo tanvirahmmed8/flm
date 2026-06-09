@@ -1,0 +1,6 @@
+[
+  {
+    "type": "sqlite",
+    "path": "e:\\Test code\\freellmapi\\server\\data\\freeapi.db"
+  }
+]

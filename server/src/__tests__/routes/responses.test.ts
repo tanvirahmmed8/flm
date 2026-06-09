@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, vi } from 'vitest';
+import { describe, it, expect, beforeAll, beforeEach, vi } from 'vitest';
 
 // Mock only routeRequest so we don't need real provider keys; keep the rest of
 // the router module (recordSuccess / recordRateLimitHit) intact.
@@ -40,6 +40,10 @@ describe('POST /v1/responses (#96)', () => {
     key = getUnifiedApiKey();
   });
 
+  beforeEach(() => {
+    mockRouteRequest.mockReset();
+  });
+
   it('rejects requests without a valid unified key (401)', async () => {
     expect((await post(app, '/v1/responses', { input: 'hi' })).status).toBe(401);
     expect((await post(app, '/v1/responses', { input: 'hi' }, 'wrong')).status).toBe(401);
@@ -68,6 +72,9 @@ describe('POST /v1/responses (#96)', () => {
   // #103: the x-api-key header (Anthropic wire format) must authenticate here
   // too, not just on /v1/chat/completions.
   it('accepts the unified key via the x-api-key header', async () => {
+    mockRouteRequest.mockImplementation(() => {
+      throw Object.assign(new Error('All models exhausted. Add more API keys or wait for rate limits to reset.'), { status: 429 });
+    });
     const server = app.listen(0);
     const addr = server.address() as any;
     const res = await fetch(`http://127.0.0.1:${addr.port}/v1/responses`, {
@@ -78,6 +85,60 @@ describe('POST /v1/responses (#96)', () => {
     server.close();
     // Auth passes (not 401); body validity / routing is covered elsewhere.
     expect(res.status).not.toBe(401);
+  });
+
+  it('returns a clean routing error when routeRequest yields no route', async () => {
+    mockRouteRequest.mockReturnValue(undefined);
+
+    const { status, text } = await post(app, '/v1/responses', { input: 'hi' }, key);
+    expect(status).toBe(503);
+    expect(JSON.parse(text).error.type).toBe('routing_error');
+  });
+
+  it('maps router-thrown 429 exhaustion to rate_limit_error', async () => {
+    mockRouteRequest.mockImplementationOnce(() => {
+      throw Object.assign(new Error('All models exhausted. Add more API keys or wait for rate limits to reset.'), { status: 429 });
+    });
+
+    const { status, text } = await post(app, '/v1/responses', { input: 'hi' }, key);
+    expect(status).toBe(429);
+    expect(JSON.parse(text).error.type).toBe('rate_limit_error');
+  });
+
+  it('maps router-thrown context exhaustion to invalid_request_error', async () => {
+    mockRouteRequest.mockImplementationOnce(() => {
+      throw Object.assign(
+        new Error('This request needs about 377684 tokens, but the largest available model context window is 262000 tokens.'),
+        { status: 400, code: 'context_length_exceeded' },
+      );
+    });
+
+    const { status, text } = await post(app, '/v1/responses', { input: 'hi' }, key);
+    expect(status).toBe(400);
+    expect(JSON.parse(text).error).toMatchObject({
+      type: 'invalid_request_error',
+      code: 'context_length_exceeded',
+    });
+  });
+
+  it('returns invalid_request_error when retries exhaust on a provider context-window failure', async () => {
+    mockRouteRequest
+      .mockReturnValueOnce(fakeRoute({
+        async chatCompletion() {
+          throw new Error('OpenRouter API error 400: This endpoint\'s maximum context length is 262000 tokens. However, you requested about 377684 tokens.');
+        },
+        async *streamChatCompletion() { /* unused */ },
+      }))
+      .mockImplementationOnce(() => {
+        throw Object.assign(new Error('All models exhausted. Add more API keys or wait for rate limits to reset.'), { status: 429 });
+      });
+
+    const { status, text } = await post(app, '/v1/responses', { input: 'hi' }, key);
+    expect(status).toBe(400);
+    expect(JSON.parse(text).error).toMatchObject({
+      type: 'invalid_request_error',
+      code: 'context_length_exceeded',
+    });
   });
 
   it('non-stream: returns a completed Responses object with usage', async () => {
@@ -140,5 +201,41 @@ describe('POST /v1/responses (#96)', () => {
     expect(text).toContain('event: response.function_call_arguments.delta');
     expect(text).toContain('event: response.function_call_arguments.done');
     expect(text).toContain('"arguments":"{\\"city\\":\\"SF\\"}"');
+  });
+
+  it('includes tool schema payload in the routing estimate for agent-sized requests', async () => {
+    mockRouteRequest.mockReturnValue(fakeRoute({
+      async chatCompletion() {
+        return {
+          id: 'c', object: 'chat.completion', created: 0, model: 'fake-model',
+          choices: [{ index: 0, message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 3, completion_tokens: 1, total_tokens: 4 },
+        };
+      },
+      async *streamChatCompletion() { /* unused */ },
+    }));
+
+    await post(app, '/v1/responses', {
+      input: 'review this codebase',
+      tools: [{
+        type: 'function',
+        name: 'read_file',
+        description: 'Read a file from the workspace',
+        parameters: {
+          type: 'object',
+          properties: {
+            path: { type: 'string', description: 'Absolute workspace path to read' },
+            reason: { type: 'string', description: 'Why this file is needed for the task' },
+            recursive: { type: 'boolean' },
+            max_bytes: { type: 'integer' },
+          },
+          required: ['path', 'reason'],
+        },
+      }],
+    }, key);
+
+    expect(mockRouteRequest).toHaveBeenCalled();
+    const estimatedTotal = mockRouteRequest.mock.calls[0][0] as number;
+    expect(estimatedTotal).toBeGreaterThan(1000);
   });
 });

@@ -307,6 +307,7 @@ const TRANSIENT_COOLDOWN_MS = 90 * 1000;
 // other providers instead of re-hammering a dead key every retry. Re-escalates
 // on the next 402 after expiry if still unpaid; a restart re-benches on first hit.
 export const PAYMENT_REQUIRED_COOLDOWN_MS = DAY;
+const PROVIDER_COOLDOWN_MODEL_ID = '*';
 
 // Decide how long to bench a model+key after an upstream 429. Escalate to the
 // long quarantine (getNextCooldownDuration, up to 24h) ONLY when the model is
@@ -384,6 +385,10 @@ export function setCooldown(platform: string, modelId: string, keyId: number, du
   persistCooldown(platform, modelId, keyId, expiresAtMs);
 }
 
+export function setProviderCooldown(platform: string, keyId: number, durationMs = 60_000) {
+  setCooldown(platform, PROVIDER_COOLDOWN_MODEL_ID, keyId, durationMs);
+}
+
 export function isOnCooldown(platform: string, modelId: string, keyId: number): boolean {
   const key = `${platform}:${modelId}:${keyId}:cooldown`;
   const now = Date.now();
@@ -405,6 +410,10 @@ export function isOnCooldown(platform: string, modelId: string, keyId: number): 
     return false;
   }
   return true;
+}
+
+export function isProviderOnCooldown(platform: string, keyId: number): boolean {
+  return isOnCooldown(platform, PROVIDER_COOLDOWN_MODEL_ID, keyId);
 }
 
 export function getRateLimitStatus(

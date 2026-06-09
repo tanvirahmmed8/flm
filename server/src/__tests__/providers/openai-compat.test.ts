@@ -97,12 +97,40 @@ describe('OpenAICompatProvider', () => {
       ok: false,
       status: 429,
       statusText: 'Rate Limited',
-      json: () => Promise.resolve({ error: { message: 'Too many requests' } }),
+      text: () => Promise.resolve(JSON.stringify({ error: { message: 'Too many requests' } })),
     } as any);
 
     await expect(
       provider.chatCompletion('key', [{ role: 'user', content: 'hi' }], 'model')
     ).rejects.toThrow(/Too many requests/);
+  });
+
+  it('includes non-standard JSON error fields instead of collapsing to bare statusText', async () => {
+    vi.spyOn(global, 'fetch').mockResolvedValueOnce({
+      ok: false,
+      status: 400,
+      statusText: 'Bad Request',
+      text: () => Promise.resolve(JSON.stringify({
+        message: 'This endpoint\'s maximum context length is 65536 tokens.',
+      })),
+    } as any);
+
+    await expect(
+      provider.chatCompletion('key', [{ role: 'user', content: 'hi' }], 'model')
+    ).rejects.toThrow(/maximum context length is 65536/);
+  });
+
+  it('includes a trimmed raw body preview when the error body is not JSON', async () => {
+    vi.spyOn(global, 'fetch').mockResolvedValueOnce({
+      ok: false,
+      status: 400,
+      statusText: 'Bad Request',
+      text: () => Promise.resolve('model validation failed: unsupported tool payload'),
+    } as any);
+
+    await expect(
+      provider.chatCompletion('key', [{ role: 'user', content: 'hi' }], 'model')
+    ).rejects.toThrow(/unsupported tool payload/);
   });
 
   it('explains a non-JSON 200 body instead of surfacing the raw parse error (#189)', async () => {
